@@ -67,30 +67,42 @@ async def recibir_mensaje(request: Request):
     numero_origen = form_data.get("From", "")
     texto_mensaje = form_data.get("Body", "")
     
+    ahora = datetime.now()
+    fecha_actual_str = ahora.strftime("%Y-%m-%d %H:%M:%S")
+    
     conexion = sqlite3.connect("peluqueria.db")
     cursor = conexion.cursor()
     
-    # Buscamos al cliente o lo creamos
-    cursor.execute("SELECT id_cliente, estado_bot, contexto_bot FROM Clientes WHERE telefono = ?", (numero_origen,))
+    # 1. RECUPERAR MEMORIA DEL CLIENTE
+    cursor.execute("SELECT id_cliente, estado_bot, contexto_bot, historial, ultima_interaccion FROM Clientes WHERE telefono = ?", (numero_origen,))
     cliente_db = cursor.fetchone()
+    
     if not cliente_db:
-        cursor.execute("INSERT INTO Clientes (telefono, nombre) VALUES (?, ?)", (numero_origen, "Cliente"))
+        historial_inicial = json.dumps([])
+        cursor.execute("INSERT INTO Clientes (telefono, nombre, historial, ultima_interaccion) VALUES (?, ?, ?, ?)", (numero_origen, "Cliente", historial_inicial, fecha_actual_str))
         conexion.commit()
-        id_cliente, estado_bot, contexto_bot = cursor.lastrowid, "normal", None
+        id_cliente, estado_bot, contexto_bot, historial_json, ultima_interaccion = cursor.lastrowid, "normal", None, historial_inicial, fecha_actual_str
     else:
-        id_cliente, estado_bot, contexto_bot = cliente_db
+        id_cliente, estado_bot, contexto_bot, historial_json, ultima_interaccion = cliente_db
 
-    # --- LA MÁQUINA DE ESTADOS ---
+    # 2. CONTROL DE TIEMPO (Regla de los 10 minutos)
+    if ultima_interaccion:
+        ultima_fecha = datetime.strptime(ultima_interaccion, "%Y-%m-%d %H:%M:%S")
+        if (ahora - ultima_fecha) > timedelta(minutes=10):
+            # Si pasaron más de 10 minutos, le borramos la memoria y reseteamos el estado
+            historial_json = "[]"
+            estado_bot = "normal"
+            contexto_bot = None
+
+    historial = json.loads(historial_json if historial_json else "[]")
     respuesta_bot = ""
 
-    # CASO A: El bot le había ofrecido una venta extra en el mensaje anterior
+    # --- LA MÁQUINA DE ESTADOS ---
     if estado_bot == "esperando_cross_sell":
-        # IA simplificada para leer un sí o un no
-        prompt_afirmacion = f"El cliente respondió esto: '{texto_mensaje}'. ¿Es una afirmación o una negación? Respondé SOLO la palabra AFIRMACION o NEGACION."
+        prompt_afirmacion = f"El cliente respondió: '{texto_mensaje}'. ¿Es una afirmación o negación? Respondé SOLO la palabra AFIRMACION o NEGACION."
         ia_estado = modelo_ia.generate_content(prompt_afirmacion).text.strip().upper()
         
         if "AFIRMACION" in ia_estado:
-            # Recuperamos el contexto: "ID_SERVICIO_EXTRA|FECHA_HORA_DONDE_EMPIEZA"
             if contexto_bot:
                 id_asociado, fecha_inicio_extra = contexto_bot.split("|")
                 cursor.execute("INSERT INTO Turnos (id_cliente, id_servicio, fecha_hora) VALUES (?, ?, ?)", (id_cliente, id_asociado, fecha_inicio_extra))
@@ -100,27 +112,34 @@ async def recibir_mensaje(request: Request):
         else:
             respuesta_bot = "¡No hay problema! Queda confirmado solo tu turno original. ¡Te esperamos!"
             
-        # Volvemos al estado normal y limpiamos la memoria
-        cursor.execute("UPDATE Clientes SET estado_bot = 'normal', contexto_bot = NULL WHERE id_cliente = ?", (id_cliente,))
-        conexion.commit()
+        estado_bot = "normal"
+        contexto_bot = None
 
-    # CASO B: Es una conversación normal
     else:
+        # Formateamos el historial para que la IA entienda el contexto
+        historial_texto = "\n".join([f"{msg['rol']}: {msg['texto']}" for msg in historial])
+        
         cursor.execute("SELECT nombre_servicio FROM Servicios")
         lista_servicios = [fila[0] for fila in cursor.fetchall()]
         
-        fecha_actual = datetime.now().strftime("%Y-%m-%d %H:%M")
         prompt_sistema = f"""
-        Hoy es: {fecha_actual}. Servicios: {', '.join(lista_servicios)}.
-        Cliente dice: "{texto_mensaje}"
+        Hoy es: {ahora.strftime('%Y-%m-%d %H:%M')}. Servicios: {', '.join(lista_servicios)}.
+        
+        HISTORIAL DE LA CHARLA RECIENTE (Usalo para entender el contexto):
+        {historial_texto}
+        
+        NUEVO MENSAJE DEL CLIENTE: "{texto_mensaje}"
+        
+        Tu tarea es entender qué quiere el cliente basándote en TODA la charla. 
+        Si el cliente dice "a la tarde" o "mañana", cruzá esa info con el servicio y fecha que venían hablando.
         
         Devolvé ÚNICAMENTE un JSON con:
         {{
             "intencion": "agendar" o "consulta",
-            "servicio": "nombre del servicio" o null,
+            "servicio": "nombre del servicio EXACTO" o null,
             "fecha_exacta": "YYYY-MM-DD HH:MM:SS" o null,
             "preferencia_dia": "mañana" o "tarde" o null,
-            "solo_fecha": "YYYY-MM-DD" o null (usar si da el día pero no la hora)
+            "solo_fecha": "YYYY-MM-DD" o null
         }}
         """
         
@@ -132,7 +151,6 @@ async def recibir_mensaje(request: Request):
 
         if datos.get("intencion") == "agendar":
             nombre_servicio = datos.get("servicio")
-            
             if nombre_servicio:
                 cursor.execute("SELECT id_servicio, duracion_minutos, id_servicio_asociado FROM Servicios WHERE nombre_servicio = ?", (nombre_servicio,))
                 serv = cursor.fetchone()
@@ -141,34 +159,26 @@ async def recibir_mensaje(request: Request):
                     id_servicio, duracion, id_asociado = serv
                     fecha_exacta = datos.get("fecha_exacta")
                     
-                    # 1. Dio el horario exacto
                     if fecha_exacta:
                         if esta_disponible(cursor, fecha_exacta, duracion):
-                            # ¡Está libre! Lo agendamos
                             cursor.execute("INSERT INTO Turnos (id_cliente, id_servicio, fecha_hora) VALUES (?, ?, ?)", (id_cliente, id_servicio, fecha_exacta))
                             respuesta_bot = f"¡Confirmado! Turno para {nombre_servicio} el {fecha_exacta}."
                             
-                            # Venta cruzada
                             if id_asociado:
                                 cursor.execute("SELECT nombre_servicio, precio FROM Servicios WHERE id_servicio = ?", (id_asociado,))
                                 asoc_db = cursor.fetchone()
                                 if asoc_db:
-                                    # Calculamos a qué hora termina el primer turno para enganchar el segundo
                                     inicio_original = datetime.strptime(fecha_exacta, "%Y-%m-%d %H:%M:%S")
                                     fin_original = inicio_original + timedelta(minutes=duracion)
                                     fecha_inicio_extra = fin_original.strftime("%Y-%m-%d %H:%M:%S")
                                     
-                                    # Guardamos la memoria para el próximo mensaje
-                                    contexto = f"{id_asociado}|{fecha_inicio_extra}"
-                                    cursor.execute("UPDATE Clientes SET estado_bot = 'esperando_cross_sell', contexto_bot = ? WHERE id_cliente = ?", (contexto, id_cliente))
+                                    contexto_bot = f"{id_asociado}|{fecha_inicio_extra}"
+                                    estado_bot = "esperando_cross_sell"
                                     
                                     respuesta_bot += f"\n\n💡 Por ${asoc_db[1]} más, podemos sumarte un {asoc_db[0]} justo a continuación. ¿Te lo agrego?"
-                            conexion.commit()
                         else:
-                            # ¡Está ocupado!
                             respuesta_bot = "Uy, ese horario ya está ocupado. Decime si preferís buscar otro hueco a la mañana o a la tarde de ese mismo día."
                     
-                    # 2. No dio la hora, pero dio la preferencia (mañana/tarde) y el día
                     elif datos.get("solo_fecha") and datos.get("preferencia_dia"):
                         fecha = datos.get("solo_fecha")
                         pref = datos.get("preferencia_dia")
@@ -178,18 +188,29 @@ async def recibir_mensaje(request: Request):
                             respuesta_bot = f"Para el {fecha} a la {pref} tengo estos horarios libres: {', '.join(sugerencias)}. ¿Cuál te sirve más?"
                         else:
                             respuesta_bot = f"Perdón, para el {fecha} a la {pref} ya no me quedan turnos para ese servicio. ¿Buscamos para otro día?"
-                    
-                    # 3. Faltan datos temporales
                     else:
                         respuesta_bot = "¿Para qué día lo buscabas? ¿Preferís un turno a la mañana o a la tarde?"
                 else:
                     respuesta_bot = "No tengo ese servicio. ¿Me lo repetís?"
             else:
                 respuesta_bot = "¿Qué servicio buscabas agendar?"
-
         else:
-            respuesta_bot = "¡Hola! ¿En qué te puedo ayudar hoy? (Podés pedirme un turno indicando el servicio y si preferís a la mañana o a la tarde)."
+            respuesta_bot = "¡Hola! ¿En qué te puedo ayudar hoy?"
 
+    # 3. ACTUALIZAR MEMORIA Y CERRAR
+    historial.append({"rol": "Cliente", "texto": texto_mensaje})
+    historial.append({"rol": "Bot", "texto": respuesta_bot})
+    
+    # Guardamos solo los últimos 6 mensajes (3 idas y vueltas) para que la IA no se sobrecargue
+    historial = historial[-6:]
+    
+    cursor.execute('''
+        UPDATE Clientes 
+        SET estado_bot = ?, contexto_bot = ?, historial = ?, ultima_interaccion = ? 
+        WHERE id_cliente = ?
+    ''', (estado_bot, contexto_bot, json.dumps(historial), fecha_actual_str, id_cliente))
+    
+    conexion.commit()
     conexion.close()
     
     xml_response = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{respuesta_bot}</Message></Response>'
