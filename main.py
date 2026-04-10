@@ -1,183 +1,196 @@
 import sqlite3
 import os
 import json
-from fastapi import FastAPI, HTTPException, Request, Response
-from pydantic import BaseModel
-from datetime import datetime
+from fastapi import FastAPI, Request, Response
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import google.generativeai as genai
 
-# --- CONFIGURACIÓN INICIAL ---
-# 1. Cargamos las variables ocultas del archivo .env
 load_dotenv()
-
-# 2. Le pasamos nuestra llave secreta a Google
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-
-# 3. Elegimos el modelo de IA (Flash es rapidísimo e ideal para tareas de texto)
 modelo_ia = genai.GenerativeModel('gemini-2.5-flash')
 
-app = FastAPI(title="API Recepcionista 24/7 con IA")
+app = FastAPI(title="Recepcionista Bot - V2 Producción")
 
-# --- MODELOS DE DATOS PYDANTIC ---
-class ClienteNuevo(BaseModel):
-    telefono: str
-    nombre: str
+# --- 1. MOTOR DE DISPONIBILIDAD (La matemática de los turnos) ---
 
-class TurnoNuevo(BaseModel):
-    id_cliente: int
-    id_servicio: int
-    fecha_hora: datetime 
-
-class MensajeWhatsApp(BaseModel):
-    numero_origen: str
-    texto_mensaje: str
-
-# --- ENDPOINTS BÁSICOS (Los que ya funcionaban perfecto) ---
-@app.get("/")
-def estado_servidor():
-    return {"status": "online", "mensaje": "¡El servidor del bot está vivo!"}
-
-@app.get("/servicios")
-def obtener_servicios():
-    conexion = sqlite3.connect("peluqueria.db")
-    conexion.row_factory = sqlite3.Row 
-    cursor = conexion.cursor()
-    cursor.execute("SELECT * FROM Servicios")
-    servicios_db = cursor.fetchall()
-    conexion.close()
-    return [{"id": s["id_servicio"], "nombre": s["nombre_servicio"], "duracion_minutos": s["duracion_minutos"], "precio": s["precio"]} for s in servicios_db]
-
-@app.post("/clientes")
-def crear_cliente(cliente: ClienteNuevo):
-    conexion = sqlite3.connect("peluqueria.db")
-    cursor = conexion.cursor()
-    try:
-        cursor.execute("INSERT INTO Clientes (telefono, nombre) VALUES (?, ?)", (cliente.telefono, cliente.nombre))
-        conexion.commit()
-        return {"mensaje": "Cliente creado", "id_cliente": cursor.lastrowid}
-    except sqlite3.IntegrityError:
-        conexion.rollback()
-        raise HTTPException(status_code=400, detail="El teléfono ya está registrado.")
-    finally:
-        conexion.close()
-
-@app.get("/turnos")
-def obtener_turnos():
-    conexion = sqlite3.connect("peluqueria.db")
-    conexion.row_factory = sqlite3.Row 
-    cursor = conexion.cursor()
+def esta_disponible(cursor, fecha_hora_solicitada, duracion_minutos):
+    """Revisa si un horario se pisa con un turno ya existente."""
+    inicio_nuevo = datetime.strptime(fecha_hora_solicitada, "%Y-%m-%d %H:%M:%S")
+    fin_nuevo = inicio_nuevo + timedelta(minutes=duracion_minutos)
     
-    # Hacemos una consulta SQL para traer los turnos
-    cursor.execute("SELECT * FROM Turnos")
-    turnos_db = cursor.fetchall()
-    conexion.close()
-
-    # Formateamos los datos
-    resultado = []
-    for t in turnos_db:
-        resultado.append({
-            "id_turno": t["id_turno"],
-            "id_cliente": t["id_cliente"],
-            "id_servicio": t["id_servicio"],
-            "fecha_hora": t["fecha_hora"],
-            "estado": t["estado"]
-        })
+    # Buscamos los turnos de ese mismo día
+    fecha_dia = inicio_nuevo.strftime("%Y-%m-%d")
+    cursor.execute('''
+        SELECT Turnos.fecha_hora, Servicios.duracion_minutos 
+        FROM Turnos 
+        JOIN Servicios ON Turnos.id_servicio = Servicios.id_servicio
+        WHERE date(Turnos.fecha_hora) = ?
+    ''', (fecha_dia,))
+    
+    turnos_dia = cursor.fetchall()
+    
+    for turno in turnos_dia:
+        inicio_existente = datetime.strptime(turno[0], "%Y-%m-%d %H:%M:%S")
+        fin_existente = inicio_existente + timedelta(minutes=turno[1])
         
-    return resultado
+        # Lógica de solapamiento: (InicioA < FinB) y (FinA > InicioB)
+        if inicio_nuevo < fin_existente and fin_nuevo > inicio_existente:
+            return False # Está ocupado
+            
+    return True # Está libre
 
-# --- NUEVO WEBHOOK CON CEREBRO DE IA ---
+def sugerir_horarios(cursor, fecha_str, preferencia, duracion_minutos):
+    """Busca 3 huecos libres segun la preferencia (mañana o tarde)"""
+    sugerencias = []
+    
+    if preferencia == "mañana":
+        hora_actual = datetime.strptime(f"{fecha_str} 09:00:00", "%Y-%m-%d %H:%M:%S")
+        limite = datetime.strptime(f"{fecha_str} 12:00:00", "%Y-%m-%d %H:%M:%S")
+    else: # tarde
+        hora_actual = datetime.strptime(f"{fecha_str} 13:00:00", "%Y-%m-%d %H:%M:%S")
+        limite = datetime.strptime(f"{fecha_str} 19:00:00", "%Y-%m-%d %H:%M:%S")
+
+    # Saltamos de a 30 minutos buscando huecos libres
+    while hora_actual < limite and len(sugerencias) < 3:
+        if esta_disponible(cursor, hora_actual.strftime("%Y-%m-%d %H:%M:%S"), duracion_minutos):
+            sugerencias.append(hora_actual.strftime("%H:%M"))
+        hora_actual += timedelta(minutes=30)
+        
+    return sugerencias
+
+# --- 2. EL WEBHOOK PRINCIPAL ---
+
 @app.post("/webhook")
 async def recibir_mensaje(request: Request):
-    # 1. Twilio manda los datos como formulario web, los atrapamos así:
     form_data = await request.form()
     numero_origen = form_data.get("From", "")
     texto_mensaje = form_data.get("Body", "")
     
-    print(f"\n--- NUEVO MENSAJE DE: {numero_origen} ---")
-    
     conexion = sqlite3.connect("peluqueria.db")
     cursor = conexion.cursor()
-    cursor.execute("SELECT nombre_servicio FROM Servicios")
-    lista_servicios = [fila[0] for fila in cursor.fetchall()]
     
-    fecha_actual = datetime.now().strftime("%Y-%m-%d %H:%M")
-    prompt_sistema = f"""
-    Sos el recepcionista virtual de una peluquería. TENÉ EN CUENTA QUE HOY ES: {fecha_actual}.
-    Los servicios que ofrecemos son: {', '.join(lista_servicios)}.
-    
-    El cliente te escribió: "{texto_mensaje}"
-    
-    Extraé la información y devolvela ÚNICAMENTE en este JSON exacto:
-    {{
-        "intencion": "agendar" o "saludo" o "consulta",
-        "servicio": "nombre del servicio solicitado" o null,
-        "fecha_hora_formateada": "YYYY-MM-DD HH:MM:SS" o null
-    }}
-    """
+    # Buscamos al cliente o lo creamos
+    cursor.execute("SELECT id_cliente, estado_bot, contexto_bot FROM Clientes WHERE telefono = ?", (numero_origen,))
+    cliente_db = cursor.fetchone()
+    if not cliente_db:
+        cursor.execute("INSERT INTO Clientes (telefono, nombre) VALUES (?, ?)", (numero_origen, "Cliente"))
+        conexion.commit()
+        id_cliente, estado_bot, contexto_bot = cursor.lastrowid, "normal", None
+    else:
+        id_cliente, estado_bot, contexto_bot = cliente_db
 
-    respuesta_ia = modelo_ia.generate_content(prompt_sistema)
-    
-    try:
-        texto_limpio = respuesta_ia.text.strip().replace("```json", "").replace("```", "")
-        datos_extraidos = json.loads(texto_limpio)
-    except json.JSONDecodeError:
-        # Si falla, devolvemos un XML de error para Twilio
-        return Response(content="<Response><Message>Error interno al leer el mensaje.</Message></Response>", media_type="application/xml")
-
+    # --- LA MÁQUINA DE ESTADOS ---
     respuesta_bot = ""
 
-    if datos_extraidos.get("intencion") == "agendar":
-        nombre_servicio = datos_extraidos.get("servicio")
-        fecha_solicitada = datos_extraidos.get("fecha_hora_formateada")
-
-        if nombre_servicio and fecha_solicitada:
-            cursor.execute("SELECT id_cliente FROM Clientes WHERE telefono = ?", (numero_origen,))
-            cliente_db = cursor.fetchone()
-            if not cliente_db:
-                cursor.execute("INSERT INTO Clientes (telefono, nombre) VALUES (?, ?)", (numero_origen, "Cliente Nuevo"))
-                id_cliente = cursor.lastrowid
+    # CASO A: El bot le había ofrecido una venta extra en el mensaje anterior
+    if estado_bot == "esperando_cross_sell":
+        # IA simplificada para leer un sí o un no
+        prompt_afirmacion = f"El cliente respondió esto: '{texto_mensaje}'. ¿Es una afirmación o una negación? Respondé SOLO la palabra AFIRMACION o NEGACION."
+        ia_estado = modelo_ia.generate_content(prompt_afirmacion).text.strip().upper()
+        
+        if "AFIRMACION" in ia_estado:
+            # Recuperamos el contexto: "ID_SERVICIO_EXTRA|FECHA_HORA_DONDE_EMPIEZA"
+            if contexto_bot:
+                id_asociado, fecha_inicio_extra = contexto_bot.split("|")
+                cursor.execute("INSERT INTO Turnos (id_cliente, id_servicio, fecha_hora) VALUES (?, ?, ?)", (id_cliente, id_asociado, fecha_inicio_extra))
+                respuesta_bot = "¡Perfecto! Ya lo sumé a tu turno. ¡Nos vemos!"
             else:
-                id_cliente = cliente_db[0]
-
-            cursor.execute("SELECT id_servicio, id_servicio_asociado FROM Servicios WHERE nombre_servicio = ?", (nombre_servicio,))
-            servicio_db = cursor.fetchone()
-
-            if servicio_db:
-                id_servicio = servicio_db[0]
-                id_asociado = servicio_db[1]
-                
-                cursor.execute('''
-                    INSERT INTO Turnos (id_cliente, id_servicio, fecha_hora)
-                    VALUES (?, ?, ?)
-                ''', (id_cliente, id_servicio, fecha_solicitada))
-                conexion.commit()
-                
-                respuesta_bot = f"¡Perfecto! Tu turno para {nombre_servicio} quedó confirmado para el {fecha_solicitada}."
-
-                if id_asociado is not None:
-                    cursor.execute("SELECT nombre_servicio, precio FROM Servicios WHERE id_servicio = ?", (id_asociado,))
-                    asociado_db = cursor.fetchone()
-                    if asociado_db:
-                        respuesta_bot += f"\n\n💡 Aprovecho para contarte que con la {nombre_servicio} solemos recomendar un {asociado_db[0]} por ${asociado_db[1]}. ¿Te gustaría que lo sumemos?"
-            else:
-                respuesta_bot = "Perdón, no encontré ese servicio en nuestra lista. ¿Me lo repetís?"
+                respuesta_bot = "Hubo un problema sumando el servicio, pero el turno original sigue en pie."
         else:
-            respuesta_bot = "Me faltan algunos datos. ¿Me confirmás qué servicio buscás y a qué hora lo querés?"
+            respuesta_bot = "¡No hay problema! Queda confirmado solo tu turno original. ¡Te esperamos!"
             
-    elif datos_extraidos.get("intencion") == "consulta":
-        respuesta_bot = "¡Hola! Por ahora soy un asistente en entrenamiento. A la brevedad te responde un humano."
+        # Volvemos al estado normal y limpiamos la memoria
+        cursor.execute("UPDATE Clientes SET estado_bot = 'normal', contexto_bot = NULL WHERE id_cliente = ?", (id_cliente,))
+        conexion.commit()
+
+    # CASO B: Es una conversación normal
     else:
-        respuesta_bot = "¡Hola! ¿En qué te puedo ayudar hoy?"
+        cursor.execute("SELECT nombre_servicio FROM Servicios")
+        lista_servicios = [fila[0] for fila in cursor.fetchall()]
+        
+        fecha_actual = datetime.now().strftime("%Y-%m-%d %H:%M")
+        prompt_sistema = f"""
+        Hoy es: {fecha_actual}. Servicios: {', '.join(lista_servicios)}.
+        Cliente dice: "{texto_mensaje}"
+        
+        Devolvé ÚNICAMENTE un JSON con:
+        {{
+            "intencion": "agendar" o "consulta",
+            "servicio": "nombre del servicio" o null,
+            "fecha_exacta": "YYYY-MM-DD HH:MM:SS" o null,
+            "preferencia_dia": "mañana" o "tarde" o null,
+            "solo_fecha": "YYYY-MM-DD" o null (usar si da el día pero no la hora)
+        }}
+        """
+        
+        try:
+            respuesta_ia = modelo_ia.generate_content(prompt_sistema)
+            datos = json.loads(respuesta_ia.text.strip().replace("```json", "").replace("```", ""))
+        except:
+            return Response(content="<Response><Message>Error interno.</Message></Response>", media_type="application/xml")
+
+        if datos.get("intencion") == "agendar":
+            nombre_servicio = datos.get("servicio")
+            
+            if nombre_servicio:
+                cursor.execute("SELECT id_servicio, duracion_minutos, id_servicio_asociado FROM Servicios WHERE nombre_servicio = ?", (nombre_servicio,))
+                serv = cursor.fetchone()
+                
+                if serv:
+                    id_servicio, duracion, id_asociado = serv
+                    fecha_exacta = datos.get("fecha_exacta")
+                    
+                    # 1. Dio el horario exacto
+                    if fecha_exacta:
+                        if esta_disponible(cursor, fecha_exacta, duracion):
+                            # ¡Está libre! Lo agendamos
+                            cursor.execute("INSERT INTO Turnos (id_cliente, id_servicio, fecha_hora) VALUES (?, ?, ?)", (id_cliente, id_servicio, fecha_exacta))
+                            respuesta_bot = f"¡Confirmado! Turno para {nombre_servicio} el {fecha_exacta}."
+                            
+                            # Venta cruzada
+                            if id_asociado:
+                                cursor.execute("SELECT nombre_servicio, precio FROM Servicios WHERE id_servicio = ?", (id_asociado,))
+                                asoc_db = cursor.fetchone()
+                                if asoc_db:
+                                    # Calculamos a qué hora termina el primer turno para enganchar el segundo
+                                    inicio_original = datetime.strptime(fecha_exacta, "%Y-%m-%d %H:%M:%S")
+                                    fin_original = inicio_original + timedelta(minutes=duracion)
+                                    fecha_inicio_extra = fin_original.strftime("%Y-%m-%d %H:%M:%S")
+                                    
+                                    # Guardamos la memoria para el próximo mensaje
+                                    contexto = f"{id_asociado}|{fecha_inicio_extra}"
+                                    cursor.execute("UPDATE Clientes SET estado_bot = 'esperando_cross_sell', contexto_bot = ? WHERE id_cliente = ?", (contexto, id_cliente))
+                                    
+                                    respuesta_bot += f"\n\n💡 Por ${asoc_db[1]} más, podemos sumarte un {asoc_db[0]} justo a continuación. ¿Te lo agrego?"
+                            conexion.commit()
+                        else:
+                            # ¡Está ocupado!
+                            respuesta_bot = "Uy, ese horario ya está ocupado. Decime si preferís buscar otro hueco a la mañana o a la tarde de ese mismo día."
+                    
+                    # 2. No dio la hora, pero dio la preferencia (mañana/tarde) y el día
+                    elif datos.get("solo_fecha") and datos.get("preferencia_dia"):
+                        fecha = datos.get("solo_fecha")
+                        pref = datos.get("preferencia_dia")
+                        sugerencias = sugerir_horarios(cursor, fecha, pref, duracion)
+                        
+                        if sugerencias:
+                            respuesta_bot = f"Para el {fecha} a la {pref} tengo estos horarios libres: {', '.join(sugerencias)}. ¿Cuál te sirve más?"
+                        else:
+                            respuesta_bot = f"Perdón, para el {fecha} a la {pref} ya no me quedan turnos para ese servicio. ¿Buscamos para otro día?"
+                    
+                    # 3. Faltan datos temporales
+                    else:
+                        respuesta_bot = "¿Para qué día lo buscabas? ¿Preferís un turno a la mañana o a la tarde?"
+                else:
+                    respuesta_bot = "No tengo ese servicio. ¿Me lo repetís?"
+            else:
+                respuesta_bot = "¿Qué servicio buscabas agendar?"
+
+        else:
+            respuesta_bot = "¡Hola! ¿En qué te puedo ayudar hoy? (Podés pedirme un turno indicando el servicio y si preferís a la mañana o a la tarde)."
 
     conexion.close()
     
-    print(f"NUESTRO BOT RESPONDERÍA: {respuesta_bot}")
-    
-    # 2. EL CAMBIO FINAL: Le respondemos a Twilio en formato XML (TwiML)
-    xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
-    <Response>
-        <Message>{respuesta_bot}</Message>
-    </Response>"""
-    
+    xml_response = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{respuesta_bot}</Message></Response>'
     return Response(content=xml_response, media_type="application/xml")
