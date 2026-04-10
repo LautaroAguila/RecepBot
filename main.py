@@ -1,7 +1,7 @@
 import sqlite3
 import os
 import json
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 from datetime import datetime
 from dotenv import load_dotenv
@@ -88,8 +88,13 @@ def obtener_turnos():
 
 # --- NUEVO WEBHOOK CON CEREBRO DE IA ---
 @app.post("/webhook")
-def recibir_mensaje(mensaje: MensajeWhatsApp):
-    print(f"\n--- NUEVO MENSAJE DE: {mensaje.numero_origen} ---")
+async def recibir_mensaje(request: Request):
+    # 1. Twilio manda los datos como formulario web, los atrapamos así:
+    form_data = await request.form()
+    numero_origen = form_data.get("From", "")
+    texto_mensaje = form_data.get("Body", "")
+    
+    print(f"\n--- NUEVO MENSAJE DE: {numero_origen} ---")
     
     conexion = sqlite3.connect("peluqueria.db")
     cursor = conexion.cursor()
@@ -101,7 +106,7 @@ def recibir_mensaje(mensaje: MensajeWhatsApp):
     Sos el recepcionista virtual de una peluquería. TENÉ EN CUENTA QUE HOY ES: {fecha_actual}.
     Los servicios que ofrecemos son: {', '.join(lista_servicios)}.
     
-    El cliente te escribió: "{mensaje.texto_mensaje}"
+    El cliente te escribió: "{texto_mensaje}"
     
     Extraé la información y devolvela ÚNICAMENTE en este JSON exacto:
     {{
@@ -117,7 +122,8 @@ def recibir_mensaje(mensaje: MensajeWhatsApp):
         texto_limpio = respuesta_ia.text.strip().replace("```json", "").replace("```", "")
         datos_extraidos = json.loads(texto_limpio)
     except json.JSONDecodeError:
-        return {"status": "Error", "mensaje": "La IA falló en la lectura"}
+        # Si falla, devolvemos un XML de error para Twilio
+        return Response(content="<Response><Message>Error interno al leer el mensaje.</Message></Response>", media_type="application/xml")
 
     respuesta_bot = ""
 
@@ -126,24 +132,21 @@ def recibir_mensaje(mensaje: MensajeWhatsApp):
         fecha_solicitada = datos_extraidos.get("fecha_hora_formateada")
 
         if nombre_servicio and fecha_solicitada:
-            # a. Buscar o crear cliente
-            cursor.execute("SELECT id_cliente FROM Clientes WHERE telefono = ?", (mensaje.numero_origen,))
+            cursor.execute("SELECT id_cliente FROM Clientes WHERE telefono = ?", (numero_origen,))
             cliente_db = cursor.fetchone()
             if not cliente_db:
-                cursor.execute("INSERT INTO Clientes (telefono, nombre) VALUES (?, ?)", (mensaje.numero_origen, "Cliente Nuevo"))
+                cursor.execute("INSERT INTO Clientes (telefono, nombre) VALUES (?, ?)", (numero_origen, "Cliente Nuevo"))
                 id_cliente = cursor.lastrowid
             else:
                 id_cliente = cliente_db[0]
 
-            # b. Buscar el ID del servicio Y SU ASOCIADO
             cursor.execute("SELECT id_servicio, id_servicio_asociado FROM Servicios WHERE nombre_servicio = ?", (nombre_servicio,))
             servicio_db = cursor.fetchone()
 
             if servicio_db:
                 id_servicio = servicio_db[0]
-                id_asociado = servicio_db[1] # Acá atrapamos el ID de la venta cruzada
+                id_asociado = servicio_db[1]
                 
-                # c. Agendar el turno
                 cursor.execute('''
                     INSERT INTO Turnos (id_cliente, id_servicio, fecha_hora)
                     VALUES (?, ?, ?)
@@ -152,22 +155,15 @@ def recibir_mensaje(mensaje: MensajeWhatsApp):
                 
                 respuesta_bot = f"¡Perfecto! Tu turno para {nombre_servicio} quedó confirmado para el {fecha_solicitada}."
 
-                # d. MAGIA: Lógica de Venta Cruzada (Cross-Selling)
                 if id_asociado is not None:
-                    # Si tiene un asociado, buscamos cómo se llama y cuánto sale
                     cursor.execute("SELECT nombre_servicio, precio FROM Servicios WHERE id_servicio = ?", (id_asociado,))
                     asociado_db = cursor.fetchone()
-                    
                     if asociado_db:
-                        nombre_extra = asociado_db[0]
-                        precio_extra = asociado_db[1]
-                        # Le sumamos la oferta a la respuesta del bot
-                        respuesta_bot += f"\n\n💡 Aprovecho para contarte que con la {nombre_servicio} solemos recomendar un {nombre_extra} por ${precio_extra}. ¿Te gustaría que lo sumemos al mismo turno?"
-
+                        respuesta_bot += f"\n\n💡 Aprovecho para contarte que con la {nombre_servicio} solemos recomendar un {asociado_db[0]} por ${asociado_db[1]}. ¿Te gustaría que lo sumemos?"
             else:
                 respuesta_bot = "Perdón, no encontré ese servicio en nuestra lista. ¿Me lo repetís?"
         else:
-            respuesta_bot = "Me faltan algunos datos. ¿Me confirmás qué servicio buscás y para cuándo?"
+            respuesta_bot = "Me faltan algunos datos. ¿Me confirmás qué servicio buscás y a qué hora lo querés?"
             
     elif datos_extraidos.get("intencion") == "consulta":
         respuesta_bot = "¡Hola! Por ahora soy un asistente en entrenamiento. A la brevedad te responde un humano."
@@ -177,6 +173,11 @@ def recibir_mensaje(mensaje: MensajeWhatsApp):
     conexion.close()
     
     print(f"NUESTRO BOT RESPONDERÍA: {respuesta_bot}")
-    print("-" * 30)
     
-    return {"status": "Procesado", "accion_bot": respuesta_bot}
+    # 2. EL CAMBIO FINAL: Le respondemos a Twilio en formato XML (TwiML)
+    xml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+        <Message>{respuesta_bot}</Message>
+    </Response>"""
+    
+    return Response(content=xml_response, media_type="application/xml")
